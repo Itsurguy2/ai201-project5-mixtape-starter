@@ -157,3 +157,75 @@ against, so they're the strongest first three. Issue #3 needs a `.distinct()`
 or restructured query rather than a one-line change, and Issue #2 needs more
 tracing before the actual defect is clear — good candidates for a second
 pass.
+
+## Root cause analysis
+
+For each chosen bug, the reported behavior was reproduced against the
+actual pre-fix code before any fix was written (`git checkout <pre-fix
+commit> -- <file>`, run a script that triggers the exact condition, confirm
+the bug, then restore the fix and re-run `pytest tests/` to confirm no
+regressions).
+
+### Issue #1 — Listening streak keeps resetting
+
+- **Root cause:** `update_listening_streak()` in `services/streak_service.py`
+  gated the consecutive-day increment on `days_since_last == 1 and
+  today.weekday() != 6`. Since Sunday is `weekday() == 6`, a legitimate
+  one-day gap that lands on a Sunday fails the `and` clause and falls
+  through to the `else` branch, resetting the streak to 1 instead of
+  incrementing it.
+- **How I reproduced it:** In an isolated in-memory DB, created a fresh
+  user and called `update_listening_streak(user, saturday)` (a Saturday,
+  `weekday()==5`) followed by `update_listening_streak(user, sunday)` (the
+  very next calendar day, `weekday()==6`). Expected streak after the Sunday
+  call: 2 (consecutive day). Actual result on the pre-fix code: streak
+  stayed at 1, reproducing the reported reset. This matches the existing
+  (previously failing) test `test_streak_increments_on_sunday`.
+- **Fix:** removed the `and today.weekday() != 6` clause so any one-day
+  gap increments the streak regardless of day of week.
+
+### Issue #4 — No notification when a friend rates my song
+
+- **Root cause:** `rate_song()` in `services/notification_service.py`
+  persists the `Rating` row and commits, but never calls
+  `create_notification()` — unlike the parallel `add_to_playlist()`
+  function in the same file, which explicitly notifies the song's sharer
+  after mutating the playlist.
+- **How I reproduced it:** In an isolated in-memory DB, created a sharer
+  user and a rater user (different from the sharer), had the sharer own a
+  song, checked the sharer's notification count (0), then called
+  `rate_song(rater.id, song.id, 5)`. Expected: sharer's notification count
+  becomes 1, with a `song_rated` entry. Actual result on the pre-fix code:
+  notification count stayed at 0 — the sharer is never told their song was
+  rated.
+- **Fix:** added a `create_notification(...)` call (type `"song_rated"`)
+  after the rating commit, skipped when the rater is the sharer themselves
+  (mirroring the self-notification guard already present in
+  `add_to_playlist`).
+
+### Issue #5 — The last song in a playlist never shows up
+
+- **Root cause:** `get_playlist_songs()` in `services/playlist_service.py`
+  builds the correctly position-ordered `songs` list, then returns
+  `[song.to_dict() for song in songs[:-1]]` — an off-by-one slice that
+  drops the last element of every playlist, regardless of size.
+- **How I reproduced it:** In an isolated in-memory DB, created a playlist
+  with 4 songs at positions 1–4 and called `get_playlist_songs()`.
+  Expected: 4 songs returned, including "Song 4" (highest position).
+  Actual result on the pre-fix code: only 3 songs returned, with "Song 4"
+  missing — reproducing the reported behavior exactly (not "some song
+  missing at random," but specifically always the last one by position).
+- **Fix:** return `[song.to_dict() for song in songs]` (drop the `[:-1]`
+  slice).
+
+### Issue #3 — not reproduced (deferred)
+
+Attempted to reproduce the reported duplicate-search-result behavior by
+seeding a song with 3 tags and calling `search_songs()` on it (the
+`search_service.py` query does an `outerjoin` against `song_tags` directly
+on the `Song` query with no `.distinct()`, which looked like a clear
+row-fanout candidate). Result: the song came back exactly once, not
+duplicated — the bug did not reproduce against the current SQLAlchemy
+version in this environment. Since the reported behavior couldn't be
+triggered, this issue was set aside in favor of the three above rather than
+"fixed" speculatively.
