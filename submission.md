@@ -168,55 +168,162 @@ regressions).
 
 ### Issue #1 — Listening streak keeps resetting
 
-- **Root cause:** `update_listening_streak()` in `services/streak_service.py`
-  gated the consecutive-day increment on `days_since_last == 1 and
-  today.weekday() != 6`. Since Sunday is `weekday() == 6`, a legitimate
-  one-day gap that lands on a Sunday fails the `and` clause and falls
-  through to the `else` branch, resetting the streak to 1 instead of
-  incrementing it.
-- **How I reproduced it:** In an isolated in-memory DB, created a fresh
-  user and called `update_listening_streak(user, saturday)` (a Saturday,
-  `weekday()==5`) followed by `update_listening_streak(user, sunday)` (the
-  very next calendar day, `weekday()==6`). Expected streak after the Sunday
-  call: 2 (consecutive day). Actual result on the pre-fix code: streak
-  stayed at 1, reproducing the reported reset. This matches the existing
-  (previously failing) test `test_streak_increments_on_sunday`.
-- **Fix:** removed the `and today.weekday() != 6` clause so any one-day
-  gap increments the streak regardless of day of week.
+**How I reproduced it:** In an isolated in-memory DB, created a fresh user
+and called `update_listening_streak(user, saturday)` (a Saturday,
+`weekday()==5`) followed by `update_listening_streak(user, sunday)` (the
+very next calendar day, `weekday()==6`). Expected streak after the Sunday
+call: 2 (consecutive day). Actual result on the pre-fix code: streak
+stayed at 1, reproducing the reported reset. This matches the existing
+(previously failing) test `test_streak_increments_on_sunday`.
+
+**How I found the root cause:** Started at the route
+(`POST /songs/<song_id>/listen` in `routes/songs.py`), which calls
+`streak_service.record_listening_event()`, which in turn calls
+`update_listening_streak()`. All of the actual day-comparison logic lives
+in that one function, so I read it top to bottom rather than guessing.
+The docstring states the rule plainly: increment on a 1-day gap, reset on
+anything else. The `if/elif/else` block matched that rule except for one
+extra clause tacked onto the `elif`: `days_since_last == 1 and
+today.weekday() != 6`. That second condition doesn't appear anywhere in
+the stated rule or in `get_streak()`/`record_listening_event()` — it's the
+one piece of logic that doesn't belong, which is what made me confident
+this was the exact line, not just a suspicious area. I confirmed by
+checking what `.weekday()` returns for Sunday (6, via Python's
+`date.weekday()` where Monday=0..Sunday=6) and tracing that a
+Saturday→Sunday transition is exactly the one case where
+`days_since_last == 1` is true but `weekday() != 6` is false, sending
+control to the `else` branch instead of the increment branch.
+
+**The root cause:** `today.weekday()` returns 6 for Sunday (Python's
+Monday=0 convention). The `elif` branch that increments the streak on a
+one-day gap was additionally guarded by `and today.weekday() != 6`, so
+whenever the *current* day of the update happens to be a Sunday, that
+guard evaluates to `False` and the one-day-gap case falls through to the
+`else` branch, which unconditionally resets `listening_streak` to 1. This
+does not just affect "some Sundays" — it affects every single user whose
+streak-continuing listen happens to land on a Sunday, regardless of how
+long their streak was.
+
+**Fix and side-effect check:** Removed the `and today.weekday() != 6`
+clause, leaving `elif days_since_last == 1:` as the sole condition for
+incrementing — this matches the docstring's stated rule exactly with no
+day-of-week special case. Checked both sides of the boundary and the
+neighboring cases directly against `update_listening_streak()`:
+Saturday→Sunday (streak 1→2, correct), Sunday→Monday (streak 1→2,
+correct — the *other* direction across the same week boundary), a
+skipped-Saturday Friday→Sunday 2-day gap (streak resets to 1, correct —
+confirms the fix didn't accidentally make Sundays always increment), and
+two listens on the same Sunday (streak stays at 1, no double-count,
+confirms the `days_since_last == 0` branch is untouched). Also re-ran the
+full `pytest tests/` suite (13/13 passing, including
+`test_streak_resets_after_skipped_day` which exercises the reset path
+this fix does not touch).
 
 ### Issue #4 — No notification when a friend rates my song
 
-- **Root cause:** `rate_song()` in `services/notification_service.py`
-  persists the `Rating` row and commits, but never calls
-  `create_notification()` — unlike the parallel `add_to_playlist()`
-  function in the same file, which explicitly notifies the song's sharer
-  after mutating the playlist.
-- **How I reproduced it:** In an isolated in-memory DB, created a sharer
-  user and a rater user (different from the sharer), had the sharer own a
-  song, checked the sharer's notification count (0), then called
-  `rate_song(rater.id, song.id, 5)`. Expected: sharer's notification count
-  becomes 1, with a `song_rated` entry. Actual result on the pre-fix code:
-  notification count stayed at 0 — the sharer is never told their song was
-  rated.
-- **Fix:** added a `create_notification(...)` call (type `"song_rated"`)
-  after the rating commit, skipped when the rater is the sharer themselves
-  (mirroring the self-notification guard already present in
-  `add_to_playlist`).
+**How I reproduced it:** In an isolated in-memory DB, created a sharer
+user and a rater user (different from the sharer), had the sharer own a
+song, checked the sharer's notification count (0), then called
+`rate_song(rater.id, song.id, 5)`. Expected: sharer's notification count
+becomes 1, with a `song_rated` entry. Actual result on the pre-fix code:
+notification count stayed at 0 — the sharer is never told their song was
+rated.
+
+**How I found the root cause:** Started at the route
+(`POST /songs/<song_id>/rate` in `routes/songs.py`), which calls
+`notification_service.rate_song()`. Read `rate_song()` top to bottom: it
+validates the score, loads the song and rater, upserts a `Rating` row,
+commits, and returns — no call to `create_notification()` anywhere in the
+function body. To confirm this was really the gap (and not, say, a
+notification being created somewhere else and filtered out on read), I
+compared it directly against `add_to_playlist()` in the same file, since
+the issue explicitly says playlist-add notifications *do* work. That
+function's structure is otherwise nearly identical (load entities, mutate
+state, commit) but ends with an explicit
+`if song.shared_by != added_by_user_id: create_notification(...)` block.
+`rate_song()` has no equivalent block at all — not a bug in *how* it
+notifies, but a complete absence of the notification step. That structural
+diff (one function has the notify block, the other doesn't) is what
+confirmed this as the root cause rather than, e.g., a bug in
+`get_notifications()`'s query/filtering, which I ruled out by reading it
+too and finding it correctly returns all rows for a `user_id` with no type
+filtering that could hide a `song_rated` row.
+
+**The root cause:** `rate_song()` never calls `create_notification()`.
+Every other user-facing action that affects a shared song
+(`add_to_playlist()`) explicitly notifies the original sharer after
+committing its change; `rate_song()` commits the `Rating` and returns with
+no equivalent step. It isn't that notifications are created and lost or
+filtered — the code path to create one for a rating event simply doesn't
+exist.
+
+**Fix and side-effect check:** Added a `create_notification(user_id=song.
+shared_by, notification_type="song_rated", body=...)` call after the
+rating commit, guarded by `if song.shared_by != user_id` — the same
+self-notification guard `add_to_playlist` already uses, so a user rating
+their own shared song doesn't notify themselves. Verified side effects
+directly: (1) self-rating produces 0 notifications, (2) a friend's first
+rating produces exactly 1 `song_rated` notification, (3) the same friend
+changing their score again still succeeds and produces another
+notification (a deliberate behavior choice, not a bug — re-rating is new
+information for the sharer, unlike `add_to_playlist`'s idempotency check
+which exists because re-adding an already-present song is a no-op), and
+(4) a `song_rated` notification and a `song_added_to_playlist`
+notification for the same user coexist correctly in `get_notifications()`
+with no interference between types. Full `pytest tests/` suite still
+13/13 passing (this file has no dedicated test suite, so route-level and
+direct-function verification was the primary check). Note: while checking
+related functionality I found that `add_to_playlist()`'s
+`playlist.songs.append(song)` throws an unrelated, pre-existing
+`IntegrityError` (`playlist_entries.position`/`added_by` are `NOT NULL`
+with no default, and the ORM relationship append doesn't populate them)
+— this is a real latent bug but outside the three issues chosen for this
+pass, so it was left unfixed and is called out separately below rather
+than folded into this commit.
 
 ### Issue #5 — The last song in a playlist never shows up
 
-- **Root cause:** `get_playlist_songs()` in `services/playlist_service.py`
-  builds the correctly position-ordered `songs` list, then returns
-  `[song.to_dict() for song in songs[:-1]]` — an off-by-one slice that
-  drops the last element of every playlist, regardless of size.
-- **How I reproduced it:** In an isolated in-memory DB, created a playlist
-  with 4 songs at positions 1–4 and called `get_playlist_songs()`.
-  Expected: 4 songs returned, including "Song 4" (highest position).
-  Actual result on the pre-fix code: only 3 songs returned, with "Song 4"
-  missing — reproducing the reported behavior exactly (not "some song
-  missing at random," but specifically always the last one by position).
-- **Fix:** return `[song.to_dict() for song in songs]` (drop the `[:-1]`
-  slice).
+**How I reproduced it:** In an isolated in-memory DB, created a playlist
+with 4 songs at positions 1–4 and called `get_playlist_songs()`. Expected:
+4 songs returned, including "Song 4" (highest position). Actual result on
+the pre-fix code: only 3 songs returned, with "Song 4" missing —
+reproducing the reported behavior exactly (not "some song missing at
+random," but specifically always the last one by position).
+
+**How I found the root cause:** Started at the route
+(`GET /playlists/<playlist_id>/songs` in `routes/playlists.py`), which
+calls `playlist_service.get_playlist_songs()` and directly returns
+`{"songs": songs, "count": len(songs)}` with no further transformation —
+so whatever that function returns is exactly what the client sees, ruling
+out the route layer as the cause. Read `get_playlist_songs()`: it queries
+`Song` joined to `playlist_entries` filtered by `playlist_id`, ordered
+ascending by `position` — that part is correct and matches the docstring
+("ordered list... ascending by position"). The very last line, though,
+is `return [song.to_dict() for song in songs[:-1]]`, not
+`songs`. The docstring even has a stale `Note: This function returns all
+songs in the playlist` directly above code that visibly does not do that
+— the contradiction between the docstring and the return line is what
+made me confident this one slice was the entire bug, rather than
+something in the query/ordering.
+
+**The root cause:** The final line applies a `[:-1]` slice to the
+already-correctly-ordered `songs` list before serializing it, which drops
+the last element of the list every time, unconditionally — regardless of
+playlist size. Because the list is ordered ascending by `position`, "the
+last element" is always the song with the highest position, i.e. the most
+recently added song. This matches the reported symptom precisely: it's
+not a random song that goes missing, it's always the last one.
+
+**Fix and side-effect check:** Removed the slice: `return [song.to_dict()
+for song in songs]`. Checked both sides of the size boundary directly
+against `get_playlist_songs()`: a single-song playlist (the case where
+`[:-1]` on a 1-element list previously returned an *empty* list — now
+correctly returns the 1 song), and an empty playlist (0 songs in, 0 songs
+out, both before and after the fix, so no regression at the other
+boundary). Also re-ran `pytest tests/`, including
+`test_playlist_returns_songs_in_order` (confirms the fix didn't disturb
+the ordering, only the slice) and `test_empty_playlist_returns_empty_list`
+(confirms the empty-playlist path is unaffected) — 13/13 passing.
 
 ### Issue #3 — not reproduced (deferred)
 
@@ -229,3 +336,21 @@ duplicated — the bug did not reproduce against the current SQLAlchemy
 version in this environment. Since the reported behavior couldn't be
 triggered, this issue was set aside in favor of the three above rather than
 "fixed" speculatively.
+
+### Additional finding (not fixed) — `add_to_playlist` crashes on real use
+
+While doing the Issue #4 side-effect check (verifying `song_rated` and
+`song_added_to_playlist` notifications coexist correctly), calling
+`add_to_playlist()` end-to-end raised an unhandled `sqlite3.IntegrityError:
+NOT NULL constraint failed: playlist_entries.position`. Cause:
+`playlist.songs.append(song)` goes through the plain `songs =
+db.relationship("Song", secondary=playlist_entries, ...)` relationship,
+which only knows how to populate the `playlist_id`/`song_id` columns of
+the secondary table — it has no way to populate `position` or `added_by`,
+which are `NOT NULL` with no default. Since `routes/playlists.py`'s
+`add_song()` only catches `ValueError`, this exception is unhandled and
+would surface as a 500 to the client on every real call to
+`POST /playlists/<id>/songs`. This is a real, reproducible bug, but it's
+not one of the five documented issues and is unrelated to the three fixed
+in this pass, so it was left alone rather than fixed opportunistically —
+flagging it here in case it's picked up in a later round.
