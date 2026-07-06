@@ -1,5 +1,12 @@
 # Mixtape — Codebase Map
 
+## Commit history
+
+`git log --oneline bugfix/mixtape`, showing one separate `fix:` commit per
+bug (`4f2c4f5`, `0e0c871`, `5fa511b`):
+
+![git log --oneline on bugfix/mixtape showing separate commits per bug fix](assets/Bugfix.png)
+
 ## AI usage
 
 This project was done using Claude Code, an agentic coding assistant with
