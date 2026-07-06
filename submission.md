@@ -1,5 +1,70 @@
 # Mixtape — Codebase Map
 
+## AI usage
+
+This project was done using Claude Code, an agentic coding assistant with
+direct file read/write and shell execution access to this repo — not a
+chat window I copy-pasted snippets into. That's a materially different
+collaboration mode than "read the code yourself, then ask AI to explain
+one function you found," and I want to describe honestly how it actually
+went rather than restate the idealized workflow from the brief.
+
+**Codebase navigation:** I asked the assistant to read the whole repo
+(`app.py`, `models.py`, every file in `routes/` and `services/`,
+`seed_data.py`, and the tests) and produce the codebase map and the "user
+rates a song" data-flow trace above. It read the actual files directly
+rather than me pasting them in, which is faster but also means I was
+relying on it to have actually opened every file rather than pattern-
+matched from file names — I spot-checked this by independently opening
+`playlist_service.py` and `notification_service.py` myself and confirming
+the map's claims (e.g. the `[:-1]` slice, the missing notify call in
+`rate_song`) were literally in the file, not inferred.
+
+**Debugging:** For each issue, the assistant traced from the route handler
+down through the service call chain itself — reading `record_listening_event`
+→ `update_listening_streak`, `rate_song` vs. `add_to_playlist`, and
+`get_playlist_songs` end to end — and formed a specific hypothesis about
+one line or condition, rather than me tracing it and asking "what's wrong
+with this function?" in isolation. It then verified each hypothesis by
+temporarily restoring the actual pre-fix file from git history and running
+a small script that exercised the exact reported condition (e.g. a
+Saturday-then-Sunday listen, a non-sharer rating a song, a 4-song
+playlist), rather than trusting the static reading alone.
+
+**Where it was wrong or incomplete until verified:**
+- For Issue #3, the code-reading hypothesis was that `search_service.py`'s
+  `outerjoin` against `song_tags` would fan out into duplicate `Song` rows
+  for multi-tag songs — a real, classic SQLAlchemy pitfall and a completely
+  reasonable read of the code. But when actually run against a seeded
+  multi-tag song, no duplication occurred with the SQLAlchemy version
+  installed in this project. The assistant had to walk back the
+  conclusion from "this is the bug" to "the reported symptom does not
+  reproduce here" based on the execution result, not the code reading. I
+  did not just accept the initial diagnosis — the discrepancy only
+  surfaced because we insisted on running it rather than stopping at "the
+  code looks wrong."
+- The side-effect check for Issue #4 (confirming the new `song_rated`
+  notification path didn't interfere with the existing
+  `song_added_to_playlist` path) surfaced a real, previously-unknown crash
+  in `add_to_playlist()` (`playlist.songs.append()` doesn't populate the
+  `NOT NULL` `position`/`added_by` columns). This wasn't something either
+  of us hypothesized going in — it only came up because the verification
+  step actually executed the adjacent code path instead of reasoning about
+  it abstractly.
+
+**Honest note on division of labor:** because the assistant had direct file
+and shell access, most of the "verification" described above (running the
+repro scripts, diffing each commit, re-running `pytest`) was executed by
+the assistant itself and reported back, not independently re-run by hand
+by me first. My own role was directing scope — which bugs to tackle,
+when to move from reproduction to fixing, when to stop — and reviewing
+the actual diffs, commit messages, and this document for accuracy rather
+than re-deriving each result myself. That's a real limitation of this
+collaboration mode worth stating plainly: the discipline of "verify before
+you trust it" was mostly enforced by having the assistant execute checks
+rather than trust its own static reading, not by me independently
+double-checking the assistant's execution results line by line.
+
 ## Main files and their responsibilities
 
 **`app.py`** — Application factory (`create_app`). Configures the SQLAlchemy
